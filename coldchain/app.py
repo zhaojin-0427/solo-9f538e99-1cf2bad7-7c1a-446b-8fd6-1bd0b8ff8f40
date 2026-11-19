@@ -22,6 +22,14 @@ from .db import connect, db_path_from_env, init_db
 from .errors import ConflictError, NotFoundError, ValidationError
 from .timeutil import display_utc
 
+BAD_FILE_FIELDS = ("bad_file", "broken_file", "original_file", "bad")
+CORRECTED_FILE_FIELDS = ("corrected_file", "fixed_file", "correction_file", "corrected")
+# In supplement mode the ordinary ``file`` field is accepted as the bad file,
+# so clients may post ``file`` + ``corrected_file``. Supplying either a bad or
+# a corrected field switches POST /api/months and POST /upload to supplement
+# mode; a lone ``file`` still means a normal month upload.
+SUPPLEMENT_BAD_FIELDS = BAD_FILE_FIELDS + ("file",)
+
 
 def _raw_intervals_from_form(form):
     zones = form.getlist("zone")
@@ -49,7 +57,7 @@ def create_app(test_config=None):
     app = Flask(__name__, instance_relative_config=False)
     app.config.update(
         SECRET_KEY=os.environ.get("COLDCHAIN_SECRET", "coldchain-ledger-dev"),
-        MAX_CONTENT_LENGTH=facts.MAX_UPLOAD_BYTES + 64 * 1024,
+        MAX_CONTENT_LENGTH=2 * facts.MAX_UPLOAD_BYTES + 128 * 1024,
         DB_PATH=str(db_path_from_env()),
     )
     if test_config:
@@ -156,8 +164,61 @@ def create_app(test_config=None):
     def upload_page():
         return render_template("upload.html")
 
+    def _has_file(files, field):
+        upload = files.get(field)
+        return upload is not None and bool(upload.filename)
+
+    def _wants_supplement(files):
+        return any(
+            _has_file(files, field)
+            for field in BAD_FILE_FIELDS + CORRECTED_FILE_FIELDS
+        )
+
+    def _read_upload(files, fields, label):
+        for field in fields:
+            if _has_file(files, field):
+                upload = files[field]
+                return upload.read(), upload.filename
+        raise ValidationError(f"补齐需要同时提交{label}")
+
+    def _read_supplement_files(files):
+        bad_raw, bad_name = _read_upload(
+            files, SUPPLEMENT_BAD_FIELDS, "当时的坏文件（字段 bad_file）"
+        )
+        fixed_raw, fixed_name = _read_upload(
+            files, CORRECTED_FILE_FIELDS, "修正版文件（字段 corrected_file）"
+        )
+        return bad_raw, bad_name, fixed_raw, fixed_name
+
+    def _supplement_requested():
+        for key in ("supplement", "supplemented", "view"):
+            value = request.args.get(key)
+            if value is None:
+                continue
+            if value.strip().lower() in ("1", "true", "yes", "on", "supplement", "supplemented"):
+                return True
+        return False
+
     @app.post("/upload")
     def upload_submit():
+        if _wants_supplement(request.files):
+            bad_raw, bad_name, fixed_raw, fixed_name = _read_supplement_files(request.files)
+            result = facts.supplement_month(
+                get_db(),
+                bad_raw=bad_raw,
+                bad_filename=bad_name,
+                corrected_raw=fixed_raw,
+                corrected_filename=fixed_name,
+                expected_month=request.form.get("month") or None,
+            )
+            flash(
+                f"{result['month']} 已补齐：找回 {result['added_count']} 行 / "
+                f"{result['added_boxes']} 箱，补齐后共 {result['row_count']} 行 / "
+                f"{result['total_boxes']} 箱。原冻结事实与旧链接口径保持不变。",
+                "success",
+            )
+            return redirect(url_for("report_page", month=result["month"], supplement=1))
+
         upload = request.files.get("file")
         if upload is None or not upload.filename:
             raise ValidationError("请选择要上传的 CSV 文件")
@@ -244,9 +305,10 @@ def create_app(test_config=None):
         versions = knowledge.list_versions(db)
         month = request.args.get("month") or (months[0]["month"] if months else None)
         version_param = request.args.get("version") or None
+        supplement = _supplement_requested()
         report = None
         if month:
-            report = knowledge.build_report(db, month, version_param)
+            report = knowledge.build_report(db, month, version_param, supplement=supplement)
         return render_template(
             "report.html",
             months=months,
@@ -254,6 +316,7 @@ def create_app(test_config=None):
             report=report,
             selected_month=month,
             selected_version=version_param or "",
+            selected_supplement=supplement,
         )
 
     # ---------- API ----------
@@ -270,6 +333,19 @@ def create_app(test_config=None):
 
     @app.post("/api/months")
     def api_upload_month():
+        if _wants_supplement(request.files):
+            bad_raw, bad_name, fixed_raw, fixed_name = _read_supplement_files(request.files)
+            result = facts.supplement_month(
+                get_db(),
+                bad_raw=bad_raw,
+                bad_filename=bad_name,
+                corrected_raw=fixed_raw,
+                corrected_filename=fixed_name,
+                expected_month=request.form.get("month") or None,
+            )
+            result["ok"] = True
+            return jsonify(result), 201
+
         upload = request.files.get("file")
         if upload is None or not upload.filename:
             raise ValidationError("请以 multipart/form-data 上传字段 file")
@@ -324,7 +400,10 @@ def create_app(test_config=None):
         month = request.args.get("month")
         if not month:
             raise ValidationError("缺少 month 参数（YYYY-MM）")
-        report = knowledge.build_report(db, month, request.args.get("version") or None)
+        supplement = _supplement_requested()
+        report = knowledge.build_report(
+            db, month, request.args.get("version") or None, supplement=supplement
+        )
         return jsonify({"ok": True, **knowledge.report_json(report)})
 
     @app.get("/api/audit")

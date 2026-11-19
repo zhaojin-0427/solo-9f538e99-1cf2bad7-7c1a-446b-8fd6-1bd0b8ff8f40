@@ -9,7 +9,7 @@ import re
 import sqlite3
 
 from .db import transaction
-from .errors import ConflictError, ValidationError
+from .errors import ConflictError, NotFoundError, ValidationError
 from .timeutil import datetime_to_us, format_utc, month_of, now_str, parse_utc, validate_month
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -67,6 +67,59 @@ def _decode(raw):
     raise ValidationError("CSV 无法按 UTF-8 或 GB18030 解码，请另存为 UTF-8 后重试")
 
 
+def unclosed_quote_line(text):
+    """Return the 1-based line where an unterminated quoted field starts.
+
+    ``csv.reader`` in its default mode silently lets an unclosed quote swallow
+    every following line into one field, which can make a short month look
+    complete. This scanner follows the same quoting rules (a quote only opens
+    a field at the very start of that field; ``""`` is an escaped quote) and
+    reports the opening line instead. Returns ``None`` when every quoted field
+    is closed. Legitimate multi-line quoted fields are not flagged.
+    """
+    in_quotes = False
+    at_field_start = True
+    line = 1
+    opened_at = None
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if in_quotes:
+            if char == '"':
+                if index + 1 < length and text[index + 1] == '"':
+                    index += 2
+                    continue
+                in_quotes = False
+                opened_at = None
+            elif char == "\n":
+                line += 1
+            index += 1
+            continue
+        if char == '"':
+            if at_field_start:
+                in_quotes = True
+                opened_at = line
+            at_field_start = False
+            index += 1
+        elif char == ",":
+            at_field_start = True
+            index += 1
+        elif char == "\r":
+            # Outside quotes csv treats CR, CRLF and LF all as record ends.
+            line += 1
+            at_field_start = True
+            index += 2 if index + 1 < length and text[index + 1] == "\n" else 1
+        elif char == "\n":
+            line += 1
+            at_field_start = True
+            index += 1
+        else:
+            at_field_start = False
+            index += 1
+    return opened_at if in_quotes else None
+
+
 def _header_map(fieldnames):
     normalized = {}
     for index, name in enumerate(fieldnames):
@@ -112,6 +165,17 @@ def parse_csv(raw, expected_month=None):
         raise ValidationError("CSV 超过 8 MiB 上限")
     sha256 = hashlib.sha256(raw).hexdigest()
     text = _decode(raw)
+
+    opened_at = unclosed_quote_line(text)
+    if opened_at is not None:
+        raise ValidationError(
+            f"第 {opened_at} 行存在未闭合的引号：其后所有行都会被读成同一个字段，"
+            "整份文件未写入。请补齐闭引号后重新上传；合法的跨行引号字段仍可正常上传。",
+            details=[
+                f"第 {opened_at} 行引号一直延伸到文件末尾仍未闭合",
+                "请先修复备注等带引号字段的闭引号，再整份重新上传",
+            ],
+        )
 
     reader = csv.reader(io.StringIO(text, newline=""))
     try:
@@ -222,6 +286,27 @@ def parse_csv(raw, expected_month=None):
     return month, rows, sha256
 
 
+def _sequence_clashes(conn, sequences):
+    """Return the first sequence number already used anywhere in the ledger."""
+    for start in range(0, len(sequences), 400):
+        chunk = sequences[start : start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        clash = conn.execute(
+            f"SELECT sequence_no FROM shipments WHERE sequence_no IN ({placeholders}) LIMIT 1",
+            chunk,
+        ).fetchone()
+        if clash:
+            return clash["sequence_no"]
+        clash = conn.execute(
+            "SELECT sequence_no FROM supplement_shipments"
+            f" WHERE sequence_no IN ({placeholders}) LIMIT 1",
+            chunk,
+        ).fetchone()
+        if clash:
+            return clash["sequence_no"]
+    return None
+
+
 def ingest_month(conn, raw, filename, expected_month=None):
     """Validate then freeze one month. All-or-nothing."""
     month, rows, sha256 = parse_csv(raw, expected_month=expected_month)
@@ -236,18 +321,11 @@ def ingest_month(conn, raw, filename, expected_month=None):
             raise ConflictError(
                 f"{month} 的事实已于 {exists['frozen_at']} 固定，不能重复上传或改写"
             )
-        seqs = [row["sequence_no"] for row in rows]
-        for start in range(0, len(seqs), 400):
-            chunk = seqs[start : start + 400]
-            placeholders = ",".join("?" for _ in chunk)
-            clash = conn.execute(
-                f"SELECT sequence_no FROM shipments WHERE sequence_no IN ({placeholders}) LIMIT 1",
-                chunk,
-            ).fetchone()
-            if clash:
-                raise ConflictError(
-                    f"流水号 {clash['sequence_no']} 已存在于其他月份，流水号必须全局唯一"
-                )
+        clash = _sequence_clashes(conn, [row["sequence_no"] for row in rows])
+        if clash:
+            raise ConflictError(
+                f"流水号 {clash} 已存在于其他月份，流水号必须全局唯一"
+            )
         frozen_at = now_str()
         try:
             conn.execute(
@@ -288,6 +366,245 @@ def ingest_month(conn, raw, filename, expected_month=None):
 
 def list_months(conn):
     return conn.execute(
-        "SELECT m.month, m.row_count, m.total_boxes, m.frozen_at, m.source_filename"
-        " FROM months m ORDER BY m.month DESC"
+        "SELECT m.month, m.row_count, m.total_boxes, m.frozen_at, m.source_filename,"
+        "       s.id AS supplement_id, s.row_count AS supplement_row_count,"
+        "       s.total_boxes AS supplement_total_boxes, s.created_at AS supplement_created_at"
+        " FROM months m LEFT JOIN month_supplements s ON s.month = m.month"
+        " ORDER BY m.month DESC"
     ).fetchall()
+
+
+def get_supplement(conn, month):
+    """Return the (at most one) supplement record for ``month`` or ``None``."""
+    return conn.execute(
+        "SELECT * FROM month_supplements WHERE month = ?", (month,)
+    ).fetchone()
+
+
+def _insert_only_quotes(bad_raw, corrected_raw):
+    """Check that ``corrected_raw`` only adds closing quote bytes.
+
+    Walks the corrected bytes alongside the bad file: every byte that is not
+    carried over verbatim must be a ``"`` inserted while a quoted field is
+    open, i.e. a closing quote. Returns the number of inserted quotes (0 means
+    the files are byte-identical, which repairs nothing).
+    """
+    if len(corrected_raw) < len(bad_raw):
+        return 0
+    position = 0
+    inserted = 0
+    in_quotes = False
+    at_field_start = True
+    for byte in corrected_raw:
+        if position < len(bad_raw) and byte == bad_raw[position]:
+            match = byte
+            position += 1
+        elif byte == 0x22 and in_quotes:
+            # A closing quote is the only byte the repair is allowed to add.
+            inserted += 1
+            in_quotes = False
+            continue
+        else:
+            return 0
+        if in_quotes:
+            if match == 0x22:
+                in_quotes = False
+            continue
+        if match == 0x22:
+            if at_field_start:
+                in_quotes = True
+            at_field_start = False
+        elif match == 0x2C:  # ','
+            at_field_start = True
+        elif match in (0x0A, 0x0D):
+            at_field_start = True
+        else:
+            at_field_start = False
+    if position != len(bad_raw):
+        return 0
+    return inserted
+
+
+def supplement_month(
+    conn,
+    *,
+    bad_raw,
+    bad_filename,
+    corrected_raw,
+    corrected_filename,
+    expected_month=None,
+):
+    """Repair a month that was frozen from a file with an unclosed quote.
+
+    The bad file must be the exact file frozen for that month (same SHA-256)
+    and must really contain an unclosed quote. The corrected file may only add
+    closing quote bytes. Every frozen shipment's SKU / UTC instant / boxes must
+    survive, and at least one previously swallowed shipment from the same
+    month must be recovered. The frozen facts themselves are never touched:
+    the repaired view lives in ``month_supplements`` and
+    ``supplement_shipments`` and is selected explicitly when reporting.
+    """
+    if isinstance(bad_raw, str):
+        bad_raw = bad_raw.encode("utf-8")
+    if isinstance(corrected_raw, str):
+        corrected_raw = corrected_raw.encode("utf-8")
+    if not bad_raw or not corrected_raw:
+        raise ValidationError("请同时提交坏文件和修正版")
+    if len(bad_raw) > MAX_UPLOAD_BYTES or len(corrected_raw) > MAX_UPLOAD_BYTES:
+        raise ValidationError("CSV 超过 8 MiB 上限")
+
+    bad_text = _decode(bad_raw)
+    opened_at = unclosed_quote_line(bad_text)
+    if opened_at is None:
+        raise ValidationError(
+            "所提交的坏文件并没有未闭合的引号；普通上传已可正常接收，无需补齐"
+        )
+
+    month, rows, corrected_sha256 = parse_csv(corrected_raw, expected_month=expected_month)
+    bad_sha256 = hashlib.sha256(bad_raw).hexdigest()
+
+    with transaction(conn):
+        month_row = conn.execute(
+            "SELECT * FROM months WHERE month = ?", (month,)
+        ).fetchone()
+        if month_row is None:
+            raise NotFoundError(f"月份 {month} 尚未冻结，不能补齐")
+        if month_row["source_sha256"] != bad_sha256:
+            raise ConflictError(
+                "坏文件的 SHA-256 与该月冻结记录不一致；只有当时被冻结的原文件才能补齐"
+            )
+        existing = get_supplement(conn, month)
+        if existing is not None:
+            raise ConflictError(
+                f"{month} 已于 {existing['created_at']} 成功补齐过一次，补齐版不可重复生成"
+            )
+
+        frozen_rows = conn.execute(
+            "SELECT sequence_no, sku, occurred_at, boxes FROM shipments"
+            " WHERE month = ? ORDER BY occurred_at_us, id",
+            (month,),
+        ).fetchall()
+        if not frozen_rows:
+            raise ConflictError(f"{month} 没有已冻结流水，无法核对修正版")
+
+        corrected_by_seq = {row["sequence_no"]: row for row in rows}
+        for frozen in frozen_rows:
+            fixed = corrected_by_seq.get(frozen["sequence_no"])
+            if fixed is None:
+                raise ValidationError(
+                    f"修正版缺少已冻结流水 {frozen['sequence_no']}；不得丢弃任何已冻结流水"
+                )
+            if (
+                fixed["sku"] != frozen["sku"]
+                or fixed["occurred_at"] != frozen["occurred_at"]
+                or fixed["boxes"] != frozen["boxes"]
+            ):
+                raise ValidationError(
+                    f"修正版改变了已冻结流水 {frozen['sequence_no']} 的 SKU、出库时刻或箱数"
+                )
+
+        frozen_sequences = {row["sequence_no"] for row in frozen_rows}
+        added_rows = [row for row in rows if row["sequence_no"] not in frozen_sequences]
+        if not added_rows:
+            raise ValidationError(
+                "修正版没有找回任何新的同月流水；若原文件本不缺少流水，则无需补齐"
+            )
+
+        if not _insert_only_quotes(bad_raw, corrected_raw):
+            raise ValidationError(
+                "修正版与坏文件不是同一份原始字节：修正版只能多出补上的闭引号，"
+                "不得改写、增删或重新编码其他内容"
+            )
+
+        added_sequences = [row["sequence_no"] for row in added_rows]
+        for start in range(0, len(added_sequences), 400):
+            chunk = added_sequences[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            clash = conn.execute(
+                "SELECT sequence_no FROM shipments"
+                f" WHERE month != ? AND sequence_no IN ({placeholders}) LIMIT 1",
+                [month, *chunk],
+            ).fetchone()
+            if clash:
+                raise ConflictError(
+                    f"流水号 {clash['sequence_no']} 已存在于其他月份，流水号必须全局唯一"
+                )
+            clash = conn.execute(
+                "SELECT sequence_no FROM supplement_shipments"
+                f" WHERE sequence_no IN ({placeholders}) LIMIT 1",
+                chunk,
+            ).fetchone()
+            if clash:
+                raise ConflictError(
+                    f"流水号 {clash['sequence_no']} 已存在于其他补齐版，流水号必须全局唯一"
+                )
+
+        added_boxes = sum(row["boxes"] for row in added_rows)
+        row_count = len(frozen_rows) + len(added_rows)
+        total_boxes = month_row["total_boxes"] + added_boxes
+        created_at = now_str()
+        safe_bad = (bad_filename or "bad.csv").strip()[:255] or "bad.csv"
+        safe_fixed = (corrected_filename or "corrected.csv").strip()[:255] or "corrected.csv"
+        try:
+            cursor = conn.execute(
+                "INSERT INTO month_supplements("
+                " month, bad_filename, bad_sha256, corrected_filename, corrected_sha256,"
+                " row_count, total_boxes, added_count, added_boxes, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    month,
+                    safe_bad,
+                    bad_sha256,
+                    safe_fixed,
+                    corrected_sha256,
+                    row_count,
+                    total_boxes,
+                    len(added_rows),
+                    added_boxes,
+                    created_at,
+                ),
+            )
+            supplement_id = cursor.lastrowid
+            conn.executemany(
+                "INSERT INTO supplement_shipments("
+                " supplement_id, month, sequence_no, sku, occurred_at, occurred_at_us,"
+                " boxes, source_row) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        supplement_id,
+                        month,
+                        row["sequence_no"],
+                        row["sku"],
+                        row["occurred_at"],
+                        datetime_to_us(row["occurred_at_dt"]),
+                        row["boxes"],
+                        row["source_row"],
+                    )
+                    for row in added_rows
+                ],
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(f"补齐写入被拒绝：{exc}（未产生任何新增流水）") from exc
+        conn.execute(
+            "INSERT INTO audit_log(at, action, month, version_no, summary) VALUES(?,?,?,?,?)",
+            (
+                created_at,
+                "supplement_month",
+                month,
+                None,
+                f"补齐 {month}：找回 {len(added_rows)} 行 / {added_boxes} 箱，"
+                f"补齐后 {row_count} 行 / {total_boxes} 箱",
+            ),
+        )
+    return {
+        "month": month,
+        "supplement_id": supplement_id,
+        "frozen_row_count": len(frozen_rows),
+        "added_count": len(added_rows),
+        "added_boxes": added_boxes,
+        "row_count": row_count,
+        "total_boxes": total_boxes,
+        "bad_sha256": bad_sha256,
+        "corrected_sha256": corrected_sha256,
+        "created_at": created_at,
+    }

@@ -6,6 +6,8 @@
 <div class="card">
   <p>CSV 需包含且仅需四列：<code>流水号</code>、<code>SKU</code>、<code>出库时刻</code>（ISO-8601 UTC，如 <code>2026-03-01T08:00:00Z</code>）、<code>箱数</code>（正整数）。
      整份文件必须同属一个 UTC 月份，且流水号全局唯一。校验不通过时不会写入任何数据。</p>
+  <p class="muted">含引号的字段必须闭合。未闭合的引号会把后面所有行吞进同一个字段，
+     这类文件整份拒绝入库；合法的跨行引号字段照常接收。</p>
   <form method="post" action="{{ url_for('upload_submit') }}" enctype="multipart/form-data" class="stack">
     <label>CSV 文件
       <input type="file" name="file" accept=".csv,text/csv" required>
@@ -14,6 +16,33 @@
       <input type="text" name="month" placeholder="2026-03" pattern="\d{4}-\d{2}">
     </label>
     <button type="submit">上传并固定该月事实</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>补齐已冻结月份</h2>
+  <p>
+    若某月当初上传的文件有未闭合的引号，后面的流水会被读成备注、导致该月少行却被冻结，
+    可在此同时提交<strong>当时的坏文件</strong>和<strong>修正版</strong>生成一个补齐版。
+  </p>
+  <ul class="muted">
+    <li>坏文件必须确有未闭合的引号，且 SHA-256 与该月冻结记录完全一致。</li>
+    <li>修正版的原始字节只能在坏文件基础上补上闭引号（可多处），不得改动其他任何字节。</li>
+    <li>修正版必须保留每笔已冻结流水的 SKU、UTC 出库时刻和箱数，并至少找回一笔同月流水。</li>
+    <li>流水号与普通上传共用全局唯一约束；每月最多成功补齐一次。补齐失败不会留下任何新增流水或补齐版。</li>
+    <li>原冻结事实、原链接与原 API 参数保持原口径；补齐版需在月报页或 <code>/api/report</code> 中显式选择。</li>
+  </ul>
+  <form method="post" action="{{ url_for('upload_submit') }}" enctype="multipart/form-data" class="stack">
+    <label>坏文件（当时冻结的原文件）
+      <input type="file" name="bad_file" accept=".csv,text/csv">
+    </label>
+    <label>修正版（仅补上闭引号）
+      <input type="file" name="corrected_file" accept=".csv,text/csv">
+    </label>
+    <label>指定月份（可选，形如 2026-03；填了就必须与修正版一致）
+      <input type="text" name="month" placeholder="2026-03" pattern="\d{4}-\d{2}">
+    </label>
+    <button type="submit">提交补齐</button>
   </form>
 </div>
 

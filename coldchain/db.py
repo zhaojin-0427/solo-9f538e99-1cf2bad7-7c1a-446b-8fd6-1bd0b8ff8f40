@@ -66,6 +66,40 @@ CREATE TABLE IF NOT EXISTS version_ranges (
 CREATE INDEX IF NOT EXISTS idx_ranges_version_sku
     ON version_ranges(version_no, sku, valid_from_us, valid_to_us);
 
+-- A month whose original file contained an unclosed quote may be repaired
+-- once. The repaired facts live here; ``months``/``shipments`` stay untouched
+-- so the original frozen view never changes.
+CREATE TABLE IF NOT EXISTS month_supplements (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    month                TEXT NOT NULL UNIQUE REFERENCES months(month),
+    bad_filename         TEXT NOT NULL,
+    bad_sha256           TEXT NOT NULL,
+    corrected_filename   TEXT NOT NULL,
+    corrected_sha256     TEXT NOT NULL,
+    row_count            INTEGER NOT NULL,
+    total_boxes          INTEGER NOT NULL,
+    added_count          INTEGER NOT NULL,
+    added_boxes          INTEGER NOT NULL,
+    created_at           TEXT NOT NULL
+);
+
+-- Only the shipments that were missing from the frozen month are stored here;
+-- every frozen shipment is carried over unchanged into the repaired view.
+CREATE TABLE IF NOT EXISTS supplement_shipments (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplement_id        INTEGER NOT NULL REFERENCES month_supplements(id),
+    month                TEXT NOT NULL,
+    sequence_no          TEXT NOT NULL,
+    sku                  TEXT NOT NULL,
+    occurred_at          TEXT NOT NULL,
+    occurred_at_us       INTEGER NOT NULL,
+    boxes                INTEGER NOT NULL CHECK (boxes > 0),
+    source_row           INTEGER NOT NULL,
+    UNIQUE (sequence_no)
+);
+CREATE INDEX IF NOT EXISTS idx_supplement_shipments_month
+    ON supplement_shipments(month);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     at                   TEXT NOT NULL,
@@ -130,6 +164,22 @@ END;
 CREATE TRIGGER IF NOT EXISTS audit_no_delete
 BEFORE DELETE ON audit_log BEGIN
     SELECT RAISE(ABORT, 'audit log is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS supplements_no_update
+BEFORE UPDATE ON month_supplements BEGIN
+    SELECT RAISE(ABORT, 'supplements are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS supplements_no_delete
+BEFORE DELETE ON month_supplements BEGIN
+    SELECT RAISE(ABORT, 'supplements are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS supplement_shipments_no_update
+BEFORE UPDATE ON supplement_shipments BEGIN
+    SELECT RAISE(ABORT, 'supplement shipments are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS supplement_shipments_no_delete
+BEFORE DELETE ON supplement_shipments BEGIN
+    SELECT RAISE(ABORT, 'supplement shipments are immutable');
 END;
 """
 

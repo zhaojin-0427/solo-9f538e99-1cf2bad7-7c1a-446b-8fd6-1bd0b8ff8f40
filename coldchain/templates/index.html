@@ -16,7 +16,12 @@
             <td>{{ month.row_count }}</td>
             <td>{{ month.total_boxes }}</td>
             <td class="mono">{{ display_utc(month.frozen_at) }}</td>
-            <td><a href="{{ url_for('report_page', month=month.month) }}">核对月报</a></td>
+            <td>
+              <a href="{{ url_for('report_page', month=month.month) }}">核对月报</a>
+              {% if month.supplement_id %}
+                · <a href="{{ url_for('report_page', month=month.month, supplement=1) }}">补齐版</a>
+              {% endif %}
+            </td>
           </tr>
         {% endfor %}
         </tbody>

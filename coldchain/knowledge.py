@@ -339,11 +339,14 @@ def _row_to_interval(row):
     }
 
 
-def build_report(conn, month, requested_version=None):
+def build_report(conn, month, requested_version=None, supplement=False):
     """Compute a report for exactly one version and one month.
 
     Facts and the selected version's ranges are read in a single read
     transaction so a concurrent correction can never leak into this report.
+    ``supplement=False`` (the default, and what the original links/API use)
+    reads the frozen facts only. ``supplement=True`` reads the repaired view:
+    every frozen shipment plus the rows recovered by the month's supplement.
     """
     from .timeutil import validate_month
 
@@ -355,6 +358,11 @@ def build_report(conn, month, requested_version=None):
         month_row = conn.execute("SELECT * FROM months WHERE month = ?", (month,)).fetchone()
         if month_row is None:
             raise NotFoundError(f"月份 {month} 尚未上传出库事实")
+        supplement_row = conn.execute(
+            "SELECT * FROM month_supplements WHERE month = ?", (month,)
+        ).fetchone()
+        if supplement and supplement_row is None:
+            raise NotFoundError(f"月份 {month} 没有已生成的补齐版")
         version_row = resolve_version(conn, requested_version)
         version_no = version_row["version_no"] if version_row else None
 
@@ -378,11 +386,19 @@ def build_report(conn, month, requested_version=None):
             for sku, items in grouped.items()
         }
 
-        shipments = conn.execute(
-            "SELECT id, sequence_no, sku, occurred_at, occurred_at_us, boxes"
-            " FROM shipments WHERE month = ? ORDER BY occurred_at_us, id",
-            (month,),
-        ).fetchall()
+        shipment_sql = (
+            "SELECT sequence_no, sku, occurred_at, occurred_at_us, boxes"
+            " FROM shipments WHERE month = ?"
+        )
+        shipment_params = [month]
+        if supplement:
+            shipment_sql += (
+                " UNION ALL SELECT sequence_no, sku, occurred_at, occurred_at_us, boxes"
+                " FROM supplement_shipments WHERE month = ?"
+            )
+            shipment_params.append(month)
+        shipment_sql += " ORDER BY occurred_at_us, sequence_no"
+        shipments = conn.execute(shipment_sql, shipment_params).fetchall()
 
     buckets = {}
     unclassified = []
@@ -424,15 +440,41 @@ def build_report(conn, month, requested_version=None):
     classified_boxes = sum(bucket["boxes"] for bucket in zones)
     unclassified_boxes = sum(item["boxes"] for item in unclassified)
 
-    return {
-        "month": month,
-        "month_row": {
-            "month": month_row["month"],
+    if supplement:
+        month_fact = {
+            "month": month,
+            "row_count": supplement_row["row_count"],
+            "total_boxes": supplement_row["total_boxes"],
+            "frozen_at": month_row["frozen_at"],
+            "source_filename": supplement_row["corrected_filename"],
+        }
+    else:
+        month_fact = {
+            "month": month,
             "row_count": month_row["row_count"],
             "total_boxes": month_row["total_boxes"],
             "frozen_at": month_row["frozen_at"],
             "source_filename": month_row["source_filename"],
-        },
+        }
+
+    return {
+        "month": month,
+        "month_row": month_fact,
+        "supplement": (
+            {
+                "supplemented": bool(supplement),
+                "available": supplement_row is not None,
+                "created_at": supplement_row["created_at"] if supplement_row else None,
+                "added_count": supplement_row["added_count"] if supplement_row else None,
+                "added_boxes": supplement_row["added_boxes"] if supplement_row else None,
+                "bad_sha256": supplement_row["bad_sha256"] if supplement_row else None,
+                "corrected_sha256": (
+                    supplement_row["corrected_sha256"] if supplement_row else None
+                ),
+            }
+            if supplement_row is not None
+            else {"supplemented": False, "available": False}
+        ),
         "version": (
             {
                 "version_no": version_row["version_no"],
@@ -496,6 +538,7 @@ def report_json(report):
         "month": report["month"],
         "version": report["version"],
         "month_fact": report["month_row"],
+        "supplement": report["supplement"],
         "zones": [
             {
                 "zone": bucket["zone"],
